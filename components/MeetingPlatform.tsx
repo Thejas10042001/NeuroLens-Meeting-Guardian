@@ -467,7 +467,7 @@ const MeetingPlatform: React.FC<MeetingPlatformProps> = ({ onBack }) => {
     const channel = new BroadcastChannel(channelName);
     signalingRef.current = channel;
 
-    console.log(`Connected to signaling channel: ${channelName}`);
+    console.log(`Connected to signaling channel: ${channelName} with ID: ${myIdRef.current}`);
 
     channel.onmessage = async (event) => {
         const msg = event.data as SignalMessage;
@@ -527,7 +527,8 @@ const MeetingPlatform: React.FC<MeetingPlatformProps> = ({ onBack }) => {
                 if (currentCount >= maxParticipantsRef.current) {
                     channel.postMessage({ type: 'meeting-full', senderId: myIdRef.current });
                 } else {
-                    channel.postMessage({ type: 'meeting-alive', senderId: myIdRef.current });
+                    // Send alive message - IMPORTANT: Ensure senderId is set!
+                    channel.postMessage({ type: 'meeting-alive', senderId: myIdRef.current || 'host-init' });
                 }
                 break;
             case 'admin-action':
@@ -583,12 +584,14 @@ const MeetingPlatform: React.FC<MeetingPlatformProps> = ({ onBack }) => {
 
   const handleHostStart = async () => {
     const code = generateMeetingCode();
-    setMeetingCode(code);
-    setHasConsented(false);
     
-    // Initialize ID immediately so we can respond to checks while in setup
+    // IMPORTANT: Set ID FIRST so it is available when the channel hook runs
     const hostId = `host-${Date.now()}`;
     myIdRef.current = hostId;
+    
+    // Trigger state update which triggers useEffect
+    setMeetingCode(code);
+    setHasConsented(false);
     
     // Clear any previous state
     setParticipants([]); 
@@ -647,7 +650,8 @@ const MeetingPlatform: React.FC<MeetingPlatformProps> = ({ onBack }) => {
   };
 
   const confirmJoinMeeting = async () => {
-    if (joinCode.length !== 5) {
+    const codeToJoin = joinCode.trim(); // TRIM INPUT
+    if (codeToJoin.length !== 5) {
       setJoinError("Please enter a valid 5-character code.");
       return;
     }
@@ -661,7 +665,7 @@ const MeetingPlatform: React.FC<MeetingPlatformProps> = ({ onBack }) => {
 
     // Validate Code by pinging the room channel
     const checkResult = await new Promise<'alive' | 'full' | 'not-found'>((resolve) => {
-        const tempChannel = new BroadcastChannel(`neuro-meet-${joinCode}`);
+        const tempChannel = new BroadcastChannel(`neuro-meet-${codeToJoin}`);
         let resolved = false;
 
         const cleanup = () => {
@@ -683,9 +687,10 @@ const MeetingPlatform: React.FC<MeetingPlatformProps> = ({ onBack }) => {
         };
 
         // Send check multiple times to ensure delivery (retry logic)
+        // FASTER PING (250ms)
         const pingInterval = setInterval(() => {
              tempChannel.postMessage({ type: 'check-meeting', senderId: 'temp-validator' } as SignalMessage);
-        }, 500);
+        }, 250);
 
         // Timeout after 5 seconds to give host time to initialize
         const timeout = setTimeout(() => {
@@ -708,7 +713,7 @@ const MeetingPlatform: React.FC<MeetingPlatformProps> = ({ onBack }) => {
     }
 
     // Code is valid, proceed
-    setMeetingCode(joinCode);
+    setMeetingCode(codeToJoin);
     const stream = await startCamera();
 
     const joinerUser: Participant = {
@@ -828,10 +833,10 @@ const MeetingPlatform: React.FC<MeetingPlatformProps> = ({ onBack }) => {
     const interval = setInterval(() => {
       setParticipants(prevParticipants => {
         return prevParticipants.map(p => {
-            // Skip local user or already kicked users
-            if (p.isLocal || p.status === 'kicked') return p;
+            // Skip kicked users
+            if (p.status === 'kicked') return p;
 
-            // Get or create model for this remote participant
+            // Get or create model for this participant (even local, so gauges animate!)
             let model = remoteModelsRef.current[p.id];
             if (!model) {
                 model = new CognitiveModel();
@@ -870,8 +875,8 @@ const MeetingPlatform: React.FC<MeetingPlatformProps> = ({ onBack }) => {
 
             // --- 1. Posture & Inappropriate Behavior Simulation ---
             let postureScore = p.metrics.postureScore;
-            // 1% chance to detect bad posture event
-            if (Math.random() < 0.01 && postureScore < 50) {
+            // 1% chance to detect bad posture event (Simulated only for NON-LOCAL)
+            if (!p.isLocal && Math.random() < 0.01 && postureScore < 50) {
                  postureScore = 100; // Trigger violation
                  // Determine type: 80% slouching, 20% inappropriate/safety
                  tracking.inappropriateFlag = Math.random() < 0.2;
@@ -898,8 +903,8 @@ const MeetingPlatform: React.FC<MeetingPlatformProps> = ({ onBack }) => {
                 tracking.badPostureSeconds = 0;
             }
 
-            // Check KICK condition for Posture/Inappropriate
-            if (tracking.badPostureSeconds >= 10) {
+            // Check KICK condition for Posture/Inappropriate (Skip local user)
+            if (tracking.badPostureSeconds >= 10 && !p.isLocal) {
                  const reason = tracking.inappropriateFlag ? 'inappropriate body language' : 'sustained bad body language';
                  eventsQueue.current.push({
                      id: Date.now() + Math.random(),
@@ -920,14 +925,14 @@ const MeetingPlatform: React.FC<MeetingPlatformProps> = ({ onBack }) => {
             }
 
             // --- 2. Toxic Language Simulation ---
-            // 0.5% chance per second to utter toxic word
-            if (Math.random() < 0.005) {
+            // 0.5% chance per second to utter toxic word (Simulated only for NON-LOCAL)
+            if (!p.isLocal && Math.random() < 0.005) {
                  tracking.toxicCount += 1;
                  const toxicWords = ["stupid", "idiot", "hate", "trash", "damn"];
                  const word = toxicWords[Math.floor(Math.random() * toxicWords.length)];
                  
-                 // Check KICK condition for Toxicity (3 Strikes)
-                 if (tracking.toxicCount >= 3) {
+                 // Check KICK condition for Toxicity (3 Strikes) (Skip local user)
+                 if (tracking.toxicCount >= 3 && !p.isLocal) {
                      eventsQueue.current.push({
                          id: Date.now() + Math.random(),
                          timestamp: Date.now(),
@@ -955,7 +960,7 @@ const MeetingPlatform: React.FC<MeetingPlatformProps> = ({ onBack }) => {
                  }
             }
 
-            // --- 3. Stress Coaching Logic ---
+            // --- 3. Stress Coaching Logic (Runs for Everyone) ---
             if (newMetrics.stress > 70) {
                 tracking.highStressSeconds += 1;
             } else {
@@ -972,7 +977,7 @@ const MeetingPlatform: React.FC<MeetingPlatformProps> = ({ onBack }) => {
                  });
             }
 
-            // --- 4. Attention/Curiosity Coaching Logic ---
+            // --- 4. Attention/Curiosity Coaching Logic (Runs for Everyone) ---
             if (newMetrics.attention < 40 || newMetrics.curiosity < 40) {
                 tracking.lowAttentionSeconds += 1;
             } else {
@@ -1168,7 +1173,7 @@ const MeetingPlatform: React.FC<MeetingPlatformProps> = ({ onBack }) => {
                         placeholder="A9K3Z"
                         value={joinCode}
                         onChange={(e) => {
-                            setJoinCode(e.target.value.toUpperCase());
+                            setJoinCode(e.target.value.toUpperCase().trim());
                             setJoinError(null);
                         }}
                         className="w-full bg-gray-800 border border-gray-700 rounded-lg p-3 text-white font-mono uppercase focus:ring-2 focus:ring-violet-500 outline-none"
