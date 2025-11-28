@@ -463,7 +463,7 @@ const MeetingPlatform: React.FC<MeetingPlatformProps> = ({ onBack }) => {
     if (!meetingCode) return;
     
     // Use BroadcastChannel for tab-to-tab communication (simulates signaling server)
-    const channelName = `neuro-meet-${meetingCode}`;
+    const channelName = `neuro-meet-${meetingCode.trim()}`;
     const channel = new BroadcastChannel(channelName);
     signalingRef.current = channel;
 
@@ -664,7 +664,7 @@ const MeetingPlatform: React.FC<MeetingPlatformProps> = ({ onBack }) => {
     setJoinError(null);
 
     // Validate Code by pinging the room channel
-    const checkResult = await new Promise<'alive' | 'full' | 'not-found'>((resolve) => {
+    const checkResult = await new Promise<'alive' | 'full' | 'timeout'>((resolve) => {
         const tempChannel = new BroadcastChannel(`neuro-meet-${codeToJoin}`);
         let resolved = false;
 
@@ -692,27 +692,30 @@ const MeetingPlatform: React.FC<MeetingPlatformProps> = ({ onBack }) => {
              tempChannel.postMessage({ type: 'check-meeting', senderId: 'temp-validator' } as SignalMessage);
         }, 250);
 
-        // Timeout after 5 seconds to give host time to initialize
+        // Timeout after 3 seconds - IF TIMEOUT, WE ASSUME ALIVE (Soft Validation)
         const timeout = setTimeout(() => {
             if (!resolved) {
                 cleanup();
-                resolve('not-found');
+                resolve('timeout');
             }
-        }, 5000); 
+        }, 3000); 
     });
 
     setIsValidating(false);
 
-    if (checkResult === 'not-found') {
-        setJoinError("Meeting code not found or meeting is inactive.");
-        return;
-    }
     if (checkResult === 'full') {
         setJoinError("This meeting has reached maximum capacity.");
         return;
     }
+    
+    // If 'alive' OR 'timeout' (Soft Validation), we proceed. 
+    // This fixes issues where browser throttles background tabs or messages drop.
+    if (checkResult === 'timeout') {
+         console.warn("Validation timed out. Joining anyway (blind trust).");
+         // Optional: Show a toast? For now, we just proceed to prevent blocking the user.
+    }
 
-    // Code is valid, proceed
+    // Code is valid (or trusted), proceed
     setMeetingCode(codeToJoin);
     const stream = await startCamera();
 
