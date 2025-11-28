@@ -62,6 +62,7 @@ type SignalMessage =
   | { type: 'leave'; senderId: string }
   | { type: 'check-meeting'; senderId: string }
   | { type: 'meeting-alive'; senderId: string }
+  | { type: 'meeting-full'; senderId: string }
   | { type: 'admin-action'; senderId: string; targetId: string; action: 'toggle-audio' | 'toggle-video' }
   | { type: 'participant-update'; senderId: string; updates: Partial<Participant> };
 
@@ -211,6 +212,11 @@ const MeetingPlatform: React.FC<MeetingPlatformProps> = ({ onBack }) => {
   const peersRef = useRef<{ [key: string]: RTCPeerConnection }>({});
   const myIdRef = useRef<string>('');
   const localStreamRef = useRef<MediaStream | null>(null);
+  const participantsRef = useRef<Participant[]>([]);
+  
+  // Use Refs for state accessible in useEffect to avoid stale closures and re-runs
+  const viewRef = useRef<PlatformView>('landing');
+  const maxParticipantsRef = useRef(4);
   
   // Remote AI Simulation Refs
   const remoteModelsRef = useRef<{ [id: string]: CognitiveModel }>({});
@@ -222,7 +228,7 @@ const MeetingPlatform: React.FC<MeetingPlatformProps> = ({ onBack }) => {
           toxicCount: number;
           highStressSeconds: number;
           lowAttentionSeconds: number;
-          inappropriateFlag: boolean; // true if nudity/inappropriate, false if just slouching
+          inappropriateFlag: boolean; 
       } 
   }>({});
   
@@ -240,6 +246,21 @@ const MeetingPlatform: React.FC<MeetingPlatformProps> = ({ onBack }) => {
   useEffect(() => {
     localStreamRef.current = localStream;
   }, [localStream]);
+
+  // Sync participants ref for use in callbacks without stale closures
+  useEffect(() => {
+      participantsRef.current = participants;
+  }, [participants]);
+  
+  // Sync view ref
+  useEffect(() => {
+      viewRef.current = view;
+  }, [view]);
+
+  // Sync max participants ref
+  useEffect(() => {
+      maxParticipantsRef.current = maxParticipants;
+  }, [maxParticipants]);
 
   // Initialize Local Camera
   const startCamera = async () => {
@@ -438,15 +459,9 @@ const MeetingPlatform: React.FC<MeetingPlatformProps> = ({ onBack }) => {
 
   // Initialize Room & Signaling
   useEffect(() => {
-    // We want the signaling to open if we are in the room, regardless of camera state
-    // This fixes the "Meeting not found" error if host denies camera
-    if (view !== 'room' || !meetingCode) return;
+    // We want signaling active in both 'room' AND 'host-setup' to allow joiners to connect immediately
+    if (!meetingCode) return;
     
-    // Set my identity
-    const myUser = participants.find(p => p.isLocal);
-    if (!myUser) return;
-    myIdRef.current = myUser.id;
-
     // Use BroadcastChannel for tab-to-tab communication (simulates signaling server)
     const channelName = `neuro-meet-${meetingCode}`;
     const channel = new BroadcastChannel(channelName);
@@ -466,8 +481,27 @@ const MeetingPlatform: React.FC<MeetingPlatformProps> = ({ onBack }) => {
         switch (msg.type) {
             case 'join':
                 addEvent('join', `${msg.user.name} joined the room.`, msg.user.name);
-                // Existing peers initiate connection to new joiner
-                initiateConnection(msg.user.id, msg.user.name, msg.user.role);
+                // If we are in setup, just add them to the list, don't initiate connection yet
+                // If we are in room, initiate connection
+                if (viewRef.current === 'room') {
+                     initiateConnection(msg.user.id, msg.user.name, msg.user.role);
+                } else {
+                     // Add to participants list so they are there when we start
+                     setParticipants(prev => {
+                         if (prev.some(p => p.id === msg.user.id)) return prev;
+                         return [...prev, {
+                             id: msg.user.id,
+                             name: msg.user.name,
+                             role: msg.user.role,
+                             isHost: false,
+                             isLocal: false,
+                             hasVideo: true, // Assume true, will update when track arrives
+                             hasAudio: true,
+                             status: 'active',
+                             metrics: { attention: 50, stress: 30, curiosity: 50, postureScore: 0 }
+                         }];
+                     });
+                }
                 break;
             case 'offer':
                 handleOffer(msg.senderId, msg.sdp, msg.user);
@@ -482,7 +516,19 @@ const MeetingPlatform: React.FC<MeetingPlatformProps> = ({ onBack }) => {
                 handleLeave(msg.senderId);
                 break;
             case 'check-meeting':
-                channel.postMessage({ type: 'meeting-alive', senderId: myIdRef.current } as SignalMessage);
+                // Check if room is full
+                // Count includes existing participants + host (who might not be in list if in setup)
+                // If in setup, participantsRef contains only joiners so far. Host is +1.
+                // If in room, participantsRef contains everyone including host.
+                
+                let currentCount = participantsRef.current.length;
+                if (viewRef.current === 'host-setup') currentCount += 1; // Count self as host
+                
+                if (currentCount >= maxParticipantsRef.current) {
+                    channel.postMessage({ type: 'meeting-full', senderId: myIdRef.current });
+                } else {
+                    channel.postMessage({ type: 'meeting-alive', senderId: myIdRef.current });
+                }
                 break;
             case 'admin-action':
                 // Handle host controls
@@ -508,20 +554,29 @@ const MeetingPlatform: React.FC<MeetingPlatformProps> = ({ onBack }) => {
         }
     };
 
-    // Announce entry
-    setTimeout(() => {
-        channel.postMessage({ 
-            type: 'join', 
-            senderId: myIdRef.current, 
-            user: { id: myIdRef.current, name: myUser.name, role: myUser.role } 
-        } as SignalMessage);
-    }, 1000);
+    // If I'm the host in setup, I don't send 'join' yet. 
+    // If I'm a joiner entering 'room', I announce myself.
+    if (view === 'room' && myIdRef.current && !myIdRef.current.startsWith('host-')) {
+        setTimeout(() => {
+            channel.postMessage({ 
+                type: 'join', 
+                senderId: myIdRef.current, 
+                user: { 
+                    id: myIdRef.current, 
+                    name: participantsRef.current.find(p=>p.isLocal)?.name || 'User', 
+                    role: participantsRef.current.find(p=>p.isLocal)?.role || 'User' 
+                } 
+            } as SignalMessage);
+        }, 1000);
+    }
 
     return () => {
+        // Only close if we are actually leaving the platform context or meeting code changes
+        // But since we removed 'view' from deps, this cleanup only runs on unmount or code change
         channel.postMessage({ type: 'leave', senderId: myIdRef.current } as SignalMessage);
         channel.close();
     };
-  }, [view, meetingCode]); // Removed localStream to ensure channel stays open
+  }, [meetingCode]); // Removed 'view' dependency to keep connection alive during transition
 
 
   // --- App Flow Handlers ---
@@ -530,6 +585,14 @@ const MeetingPlatform: React.FC<MeetingPlatformProps> = ({ onBack }) => {
     const code = generateMeetingCode();
     setMeetingCode(code);
     setHasConsented(false);
+    
+    // Initialize ID immediately so we can respond to checks while in setup
+    const hostId = `host-${Date.now()}`;
+    myIdRef.current = hostId;
+    
+    // Clear any previous state
+    setParticipants([]); 
+    
     setView('host-setup');
   };
 
@@ -537,8 +600,9 @@ const MeetingPlatform: React.FC<MeetingPlatformProps> = ({ onBack }) => {
     // Attempt to start camera, but proceed even if it fails
     const stream = await startCamera();
     
+    // Add Host to participants (use existing ID)
     const hostUser: Participant = {
-      id: `host-${Date.now()}`,
+      id: myIdRef.current, // Use the ID generated in handleHostStart
       name: 'You (Host)',
       role: 'Host',
       isHost: true,
@@ -550,10 +614,29 @@ const MeetingPlatform: React.FC<MeetingPlatformProps> = ({ onBack }) => {
       metrics: { attention: 85, stress: 20, curiosity: 75, postureScore: 0 }
     };
     
-    setParticipants([hostUser]);
+    setParticipants(prev => {
+        // Merge host into existing list (which might contain early joiners)
+        return [...prev, hostUser];
+    });
+    
     setMeetingStartTime(Date.now());
     addEvent('join', 'Meeting started by Host.', 'Host');
+    
+    // Connect to any joiners who are already waiting
+    participantsRef.current.forEach(p => {
+        initiateConnection(p.id, p.name, p.role);
+    });
+
     setView('room');
+    
+    // Announce to channel that Host is fully in room (triggers offer exchange if needed)
+    if (signalingRef.current) {
+        signalingRef.current.postMessage({ 
+            type: 'join', 
+            senderId: myIdRef.current, 
+            user: { id: hostUser.id, name: hostUser.name, role: hostUser.role } 
+        } as SignalMessage);
+    }
   };
 
   const handleJoinStart = () => {
@@ -577,7 +660,7 @@ const MeetingPlatform: React.FC<MeetingPlatformProps> = ({ onBack }) => {
     setJoinError(null);
 
     // Validate Code by pinging the room channel
-    const isValid = await new Promise<boolean>((resolve) => {
+    const checkResult = await new Promise<'alive' | 'full' | 'not-found'>((resolve) => {
         const tempChannel = new BroadcastChannel(`neuro-meet-${joinCode}`);
         let resolved = false;
 
@@ -592,7 +675,10 @@ const MeetingPlatform: React.FC<MeetingPlatformProps> = ({ onBack }) => {
             const msg = e.data as SignalMessage;
             if (msg.type === 'meeting-alive') {
                 cleanup();
-                resolve(true);
+                resolve('alive');
+            } else if (msg.type === 'meeting-full') {
+                cleanup();
+                resolve('full');
             }
         };
 
@@ -601,19 +687,23 @@ const MeetingPlatform: React.FC<MeetingPlatformProps> = ({ onBack }) => {
              tempChannel.postMessage({ type: 'check-meeting', senderId: 'temp-validator' } as SignalMessage);
         }, 500);
 
-        // Timeout after 3 seconds
+        // Timeout after 5 seconds to give host time to initialize
         const timeout = setTimeout(() => {
             if (!resolved) {
                 cleanup();
-                resolve(false);
+                resolve('not-found');
             }
-        }, 3000); 
+        }, 5000); 
     });
 
     setIsValidating(false);
 
-    if (!isValid) {
+    if (checkResult === 'not-found') {
         setJoinError("Meeting code not found or meeting is inactive.");
+        return;
+    }
+    if (checkResult === 'full') {
+        setJoinError("This meeting has reached maximum capacity.");
         return;
     }
 
@@ -635,6 +725,8 @@ const MeetingPlatform: React.FC<MeetingPlatformProps> = ({ onBack }) => {
     };
 
     setParticipants([joinerUser]);
+    // CRITICAL: Set ID immediately
+    myIdRef.current = joinerUser.id;
     setMeetingStartTime(Date.now());
     addEvent('join', `You joined the meeting.`, userName);
     setView('room');
@@ -987,7 +1079,7 @@ const MeetingPlatform: React.FC<MeetingPlatformProps> = ({ onBack }) => {
             </button>
         </div>
         <div className="mt-8 text-center text-gray-500 text-sm max-w-md">
-            <p>&copy; 2025 NeuroLens Meeting Guardian. Created by Thejas Sreenivasu.</p>
+            <p>&copy; 2025 NeuroLens Meeting Guardian. Copyrights by thejas sreenivasu.</p>
         </div>
       </div>
     );
@@ -1037,6 +1129,9 @@ const MeetingPlatform: React.FC<MeetingPlatformProps> = ({ onBack }) => {
              <div className="w-full mb-8 text-center bg-black/30 p-4 rounded-lg border border-dashed border-gray-600">
                 <p className="text-sm text-gray-500 mb-2">Share this Code</p>
                 <p className="text-4xl font-mono font-bold text-cyan-400 tracking-wider">{meetingCode}</p>
+                {participants.length > 0 && (
+                    <p className="text-xs text-green-400 mt-2 animate-pulse">{participants.length} Participant(s) Waiting...</p>
+                )}
              </div>
 
              <div className="flex gap-4 w-full">
