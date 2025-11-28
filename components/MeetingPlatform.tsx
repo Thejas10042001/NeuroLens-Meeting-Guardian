@@ -17,23 +17,23 @@ interface MeetingPlatformProps {
 
 // Icons for controls
 const MicIcon = () => (
-    <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
+    <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
         <path fillRule="evenodd" d="M7 4a3 3 0 016 0v4a3 3 0 11-6 0V4zm4 10.93A7.001 7.001 0 0017 8a1 1 0 10-2 0A5 5 0 015 8a1 1 0 00-2 0 7.001 7.001 0 006 6.93V17H6a1 1 0 100 2h8a1 1 0 100-2h-3v-2.07z" clipRule="evenodd" />
     </svg>
 );
 const MicOffIcon = () => (
-    <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
+    <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
         <path fillRule="evenodd" d="M9.383 3.076A1 1 0 0110 4v12.733l-4.518 2.375a1 1 0 01-1.45-1.054V4.733l1.223-.656a1 1 0 01.128-.001zm1.334 0L14.94 5.39a1 1 0 01.53 1.348l-1.332 3.86a1 1 0 01-1.34.626L10 10.733V3.076z" clipRule="evenodd" />
         <line x1="3" y1="3" x2="17" y2="17" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
     </svg>
 );
 const VideoIcon = () => (
-    <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
+    <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
         <path d="M2 6a2 2 0 012-2h6a2 2 0 012 2v8a2 2 0 01-2 2H4a2 2 0 01-2-2V6zM14.553 7.106A1 1 0 0014 8v4a1 1 0 00.553.894l2 1A1 1 0 0018 13V7a1 1 0 00-1.447-.894l-2 1z" />
     </svg>
 );
 const VideoOffIcon = () => (
-    <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
+    <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
         <path fillRule="evenodd" d="M3.707 2.293a1 1 0 00-1.414 1.414l14 14a1 1 0 001.414-1.414l-1.473-1.473A10.014 10.014 0 0019.542 10C18.268 5.943 14.478 3 10 3a9.958 9.958 0 00-4.512 1.074l-1.78-1.781zm4.261 4.26l1.514 1.515a2.003 2.003 0 012.45 2.45l1.514 1.514a4 4 0 00-5.478-5.478z" clipRule="evenodd" />
         <path d="M12.454 16.697L9.75 13.992a4 4 0 01-3.742-3.741L2.335 6.578A9.98 9.98 0 00.458 10c1.274 4.057 5.065 7 9.542 7 .847 0 1.669-.105 2.454-.303z" />
     </svg>
@@ -210,6 +210,7 @@ const MeetingPlatform: React.FC<MeetingPlatformProps> = ({ onBack }) => {
   const signalingRef = useRef<BroadcastChannel | null>(null);
   const peersRef = useRef<{ [key: string]: RTCPeerConnection }>({});
   const myIdRef = useRef<string>('');
+  const localStreamRef = useRef<MediaStream | null>(null);
   
   // Remote AI Simulation Refs
   const remoteModelsRef = useRef<{ [id: string]: CognitiveModel }>({});
@@ -232,6 +233,13 @@ const MeetingPlatform: React.FC<MeetingPlatformProps> = ({ onBack }) => {
 
   // Determine if amIHost
   const amIHost = participants.find(p => p.isLocal)?.isHost ?? false;
+  // Determine local user state for footer controls
+  const localParticipant = participants.find(p => p.isLocal);
+
+  // Sync ref with state
+  useEffect(() => {
+    localStreamRef.current = localStream;
+  }, [localStream]);
 
   // Initialize Local Camera
   const startCamera = async () => {
@@ -252,6 +260,7 @@ const MeetingPlatform: React.FC<MeetingPlatformProps> = ({ onBack }) => {
         msg = "No camera or microphone found.";
       }
       setCameraError(msg);
+      // Return null but allow meeting to proceed
       return null;
     }
   };
@@ -315,8 +324,8 @@ const MeetingPlatform: React.FC<MeetingPlatformProps> = ({ onBack }) => {
       peersRef.current[targetId] = pc;
 
       // Add local tracks
-      if (localStream) {
-          localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+      if (localStreamRef.current) {
+          localStreamRef.current.getTracks().forEach(track => pc.addTrack(track, localStreamRef.current!));
       }
 
       // Handle ICE candidates
@@ -429,7 +438,9 @@ const MeetingPlatform: React.FC<MeetingPlatformProps> = ({ onBack }) => {
 
   // Initialize Room & Signaling
   useEffect(() => {
-    if (view !== 'room' || !meetingCode || !localStream) return;
+    // We want the signaling to open if we are in the room, regardless of camera state
+    // This fixes the "Meeting not found" error if host denies camera
+    if (view !== 'room' || !meetingCode) return;
     
     // Set my identity
     const myUser = participants.find(p => p.isLocal);
@@ -475,16 +486,16 @@ const MeetingPlatform: React.FC<MeetingPlatformProps> = ({ onBack }) => {
                 break;
             case 'admin-action':
                 // Handle host controls
-                if (msg.targetId === myIdRef.current && localStream) {
+                if (msg.targetId === myIdRef.current && localStreamRef.current) {
                     if (msg.action === 'toggle-audio') {
-                        localStream.getAudioTracks().forEach(t => t.enabled = !t.enabled);
-                        const hasAudio = localStream.getAudioTracks().some(t => t.enabled);
+                        localStreamRef.current.getAudioTracks().forEach(t => t.enabled = !t.enabled);
+                        const hasAudio = localStreamRef.current.getAudioTracks().some(t => t.enabled);
                         setParticipants(prev => prev.map(p => p.isLocal ? { ...p, hasAudio } : p));
                         channel.postMessage({ type: 'participant-update', senderId: myIdRef.current, updates: { hasAudio } } as SignalMessage);
                         addEvent('warning', hasAudio ? 'Host enabled your microphone.' : 'Host disabled your microphone.', 'You');
                     } else if (msg.action === 'toggle-video') {
-                        localStream.getVideoTracks().forEach(t => t.enabled = !t.enabled);
-                        const hasVideo = localStream.getVideoTracks().some(t => t.enabled);
+                        localStreamRef.current.getVideoTracks().forEach(t => t.enabled = !t.enabled);
+                        const hasVideo = localStreamRef.current.getVideoTracks().some(t => t.enabled);
                         setParticipants(prev => prev.map(p => p.isLocal ? { ...p, hasVideo } : p));
                         channel.postMessage({ type: 'participant-update', senderId: myIdRef.current, updates: { hasVideo } } as SignalMessage);
                         addEvent('warning', hasVideo ? 'Host enabled your camera.' : 'Host disabled your camera.', 'You');
@@ -508,8 +519,9 @@ const MeetingPlatform: React.FC<MeetingPlatformProps> = ({ onBack }) => {
 
     return () => {
         channel.postMessage({ type: 'leave', senderId: myIdRef.current } as SignalMessage);
+        channel.close();
     };
-  }, [view, meetingCode, localStream]); // eslint-disable-line
+  }, [view, meetingCode]); // Removed localStream to ensure channel stays open
 
 
   // --- App Flow Handlers ---
@@ -522,6 +534,7 @@ const MeetingPlatform: React.FC<MeetingPlatformProps> = ({ onBack }) => {
   };
 
   const confirmHostMeeting = async () => {
+    // Attempt to start camera, but proceed even if it fails
     const stream = await startCamera();
     
     const hostUser: Participant = {
@@ -568,26 +581,33 @@ const MeetingPlatform: React.FC<MeetingPlatformProps> = ({ onBack }) => {
         const tempChannel = new BroadcastChannel(`neuro-meet-${joinCode}`);
         let resolved = false;
 
-        const timer = setTimeout(() => {
-            if (!resolved) {
-                resolved = true;
-                tempChannel.close();
-                resolve(false);
-            }
-        }, 2000); // 2 second timeout
+        const cleanup = () => {
+            resolved = true;
+            clearInterval(pingInterval);
+            clearTimeout(timeout);
+            tempChannel.close();
+        };
 
         tempChannel.onmessage = (e) => {
             const msg = e.data as SignalMessage;
-            if (msg.type === 'meeting-alive' && !resolved) {
-                resolved = true;
-                clearTimeout(timer);
-                tempChannel.close();
+            if (msg.type === 'meeting-alive') {
+                cleanup();
                 resolve(true);
             }
         };
 
-        // Send check
-        tempChannel.postMessage({ type: 'check-meeting', senderId: 'temp-validator' } as SignalMessage);
+        // Send check multiple times to ensure delivery (retry logic)
+        const pingInterval = setInterval(() => {
+             tempChannel.postMessage({ type: 'check-meeting', senderId: 'temp-validator' } as SignalMessage);
+        }, 500);
+
+        // Timeout after 3 seconds
+        const timeout = setTimeout(() => {
+            if (!resolved) {
+                cleanup();
+                resolve(false);
+            }
+        }, 3000); 
     });
 
     setIsValidating(false);
@@ -653,6 +673,48 @@ const MeetingPlatform: React.FC<MeetingPlatformProps> = ({ onBack }) => {
         } as SignalMessage);
     }
   };
+
+  // Local Controls
+  const toggleLocalAudio = () => {
+    if (!localStream) return;
+    const audioTracks = localStream.getAudioTracks();
+    if (audioTracks.length === 0) return;
+
+    const enabled = !audioTracks[0].enabled;
+    audioTracks.forEach(t => t.enabled = enabled);
+
+    setParticipants(prev => prev.map(p => p.isLocal ? { ...p, hasAudio: enabled } : p));
+    
+    // Notify others
+    if (signalingRef.current) {
+        signalingRef.current.postMessage({
+            type: 'participant-update',
+            senderId: myIdRef.current,
+            updates: { hasAudio: enabled }
+        } as SignalMessage);
+    }
+  };
+
+  const toggleLocalVideo = () => {
+    if (!localStream) return;
+    const videoTracks = localStream.getVideoTracks();
+    if (videoTracks.length === 0) return;
+
+    const enabled = !videoTracks[0].enabled;
+    videoTracks.forEach(t => t.enabled = enabled);
+
+    setParticipants(prev => prev.map(p => p.isLocal ? { ...p, hasVideo: enabled } : p));
+    
+    // Notify others
+    if (signalingRef.current) {
+        signalingRef.current.postMessage({
+            type: 'participant-update',
+            senderId: myIdRef.current,
+            updates: { hasVideo: enabled }
+        } as SignalMessage);
+    }
+  };
+
 
   // Manual Bot Simulation
   const addSimulatedBot = () => {
@@ -1282,11 +1344,27 @@ const MeetingPlatform: React.FC<MeetingPlatformProps> = ({ onBack }) => {
                 </div>
             </div>
             
-            {/* Control Bar (Mock) */}
-            <div className="p-3 border-t border-gray-800 flex justify-around">
-                <button className="p-2 rounded-full bg-gray-800 text-white hover:bg-gray-700">🎤</button>
-                <button className="p-2 rounded-full bg-gray-800 text-white hover:bg-gray-700">📷</button>
-                <button className="p-2 rounded-full bg-gray-800 text-white hover:bg-gray-700">💬</button>
+            {/* Control Bar */}
+            <div className="p-3 border-t border-gray-800 flex justify-around items-center bg-gray-900/80 backdrop-blur z-20">
+                <button 
+                    onClick={toggleLocalAudio}
+                    className={`p-3 rounded-full transition-all ${localParticipant?.hasAudio ? 'bg-gray-700 hover:bg-gray-600 text-white' : 'bg-red-600 hover:bg-red-500 text-white'}`}
+                    title={localParticipant?.hasAudio ? "Mute Microphone" : "Unmute Microphone"}
+                >
+                    {localParticipant?.hasAudio ? <MicIcon /> : <MicOffIcon />}
+                </button>
+                
+                <button 
+                    onClick={toggleLocalVideo}
+                    className={`p-3 rounded-full transition-all ${localParticipant?.hasVideo ? 'bg-gray-700 hover:bg-gray-600 text-white' : 'bg-red-600 hover:bg-red-500 text-white'}`}
+                    title={localParticipant?.hasVideo ? "Turn Camera Off" : "Turn Camera On"}
+                >
+                    {localParticipant?.hasVideo ? <VideoIcon /> : <VideoOffIcon />}
+                </button>
+                
+                <button className="p-3 rounded-full bg-gray-800 text-gray-400 hover:bg-gray-700 hover:text-white transition-colors" title="Chat (Coming Soon)">
+                    <span className="text-xl leading-none">💬</span>
+                </button>
             </div>
         </div>
     </div>
