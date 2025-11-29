@@ -38,6 +38,11 @@ const VideoOffIcon = () => (
         <path d="M12.454 16.697L9.75 13.992a4 4 0 01-3.742-3.741L2.335 6.578A9.98 9.98 0 00.458 10c1.274 4.057 5.065 7 9.542 7 .847 0 1.669-.105 2.454-.303z" />
     </svg>
 );
+const RefreshIcon = () => (
+    <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+        <path strokeLinecap="round" strokeLinejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+    </svg>
+);
 
 // Helper for CSV escaping
 const escapeCSV = (str: string | undefined | null) => {
@@ -62,6 +67,7 @@ type SignalMessage =
   | { type: 'leave'; senderId: string }
   | { type: 'check-meeting'; senderId: string }
   | { type: 'meeting-alive'; senderId: string }
+  | { type: 'meeting-heartbeat'; senderId: string }
   | { type: 'meeting-full'; senderId: string }
   | { type: 'admin-action'; senderId: string; targetId: string; action: 'toggle-audio' | 'toggle-video' }
   | { type: 'participant-update'; senderId: string; updates: Partial<Participant> };
@@ -210,6 +216,7 @@ const MeetingPlatform: React.FC<MeetingPlatformProps> = ({ onBack }) => {
   // WebRTC Refs
   const signalingRef = useRef<BroadcastChannel | null>(null);
   const peersRef = useRef<{ [key: string]: RTCPeerConnection }>({});
+  const iceCandidatesQueue = useRef<{ [key: string]: RTCIceCandidateInit[] }>({});
   const myIdRef = useRef<string>('');
   const localStreamRef = useRef<MediaStream | null>(null);
   const participantsRef = useRef<Participant[]>([]);
@@ -289,13 +296,13 @@ const MeetingPlatform: React.FC<MeetingPlatformProps> = ({ onBack }) => {
   // Cleanup on unmount
   useEffect(() => {
     return () => {
-      if (localStream) {
-        localStream.getTracks().forEach(track => track.stop());
+      if (localStreamRef.current) {
+        localStreamRef.current.getTracks().forEach(track => track.stop());
       }
       if (signalingRef.current) {
           signalingRef.current.close();
       }
-      Object.values(peersRef.current).forEach(pc => pc.close());
+      Object.values(peersRef.current).forEach((pc) => (pc as RTCPeerConnection).close());
     };
   }, []); // eslint-disable-line
 
@@ -343,6 +350,11 @@ const MeetingPlatform: React.FC<MeetingPlatformProps> = ({ onBack }) => {
 
       const pc = new RTCPeerConnection(rtcConfig);
       peersRef.current[targetId] = pc;
+      
+      // Initialize candidate queue
+      if (!iceCandidatesQueue.current[targetId]) {
+          iceCandidatesQueue.current[targetId] = [];
+      }
 
       // Add local tracks
       if (localStreamRef.current) {
@@ -418,6 +430,14 @@ const MeetingPlatform: React.FC<MeetingPlatformProps> = ({ onBack }) => {
       
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
+      
+      // Process any queued candidates
+      if (iceCandidatesQueue.current[senderId]) {
+          for (const candidate of iceCandidatesQueue.current[senderId]) {
+              await pc.addIceCandidate(new RTCIceCandidate(candidate));
+          }
+          iceCandidatesQueue.current[senderId] = [];
+      }
 
       if (signalingRef.current) {
           signalingRef.current.postMessage({
@@ -433,13 +453,26 @@ const MeetingPlatform: React.FC<MeetingPlatformProps> = ({ onBack }) => {
       const pc = peersRef.current[senderId];
       if (pc) {
           await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+          // Process queued candidates
+          if (iceCandidatesQueue.current[senderId]) {
+              for (const candidate of iceCandidatesQueue.current[senderId]) {
+                  await pc.addIceCandidate(new RTCIceCandidate(candidate));
+              }
+              iceCandidatesQueue.current[senderId] = [];
+          }
       }
   };
 
   const handleCandidate = async (senderId: string, candidate: RTCIceCandidateInit) => {
       const pc = peersRef.current[senderId];
       if (pc) {
-          await pc.addIceCandidate(new RTCIceCandidate(candidate));
+          if (pc.remoteDescription) {
+            await pc.addIceCandidate(new RTCIceCandidate(candidate));
+          } else {
+            // Queue candidate if remote description not yet set
+            if (!iceCandidatesQueue.current[senderId]) iceCandidatesQueue.current[senderId] = [];
+            iceCandidatesQueue.current[senderId].push(candidate);
+          }
       }
   };
 
@@ -517,18 +550,19 @@ const MeetingPlatform: React.FC<MeetingPlatformProps> = ({ onBack }) => {
                 break;
             case 'check-meeting':
                 // Check if room is full
-                // Count includes existing participants + host (who might not be in list if in setup)
-                // If in setup, participantsRef contains only joiners so far. Host is +1.
-                // If in room, participantsRef contains everyone including host.
-                
                 let currentCount = participantsRef.current.length;
                 if (viewRef.current === 'host-setup') currentCount += 1; // Count self as host
                 
                 if (currentCount >= maxParticipantsRef.current) {
                     channel.postMessage({ type: 'meeting-full', senderId: myIdRef.current });
                 } else {
-                    // Send alive message - IMPORTANT: Ensure senderId is set!
                     channel.postMessage({ type: 'meeting-alive', senderId: myIdRef.current || 'host-init' });
+                }
+                break;
+            case 'meeting-heartbeat':
+                // If I am a joiner and I am not connected to this host, trigger join
+                if (!participantsRef.current.find(p => p.id === msg.senderId) && viewRef.current === 'room') {
+                     announceJoin();
                 }
                 break;
             case 'admin-action':
@@ -555,29 +589,52 @@ const MeetingPlatform: React.FC<MeetingPlatformProps> = ({ onBack }) => {
         }
     };
 
-    // If I'm the host in setup, I don't send 'join' yet. 
-    // If I'm a joiner entering 'room', I announce myself.
-    if (view === 'room' && myIdRef.current && !myIdRef.current.startsWith('host-')) {
-        setTimeout(() => {
-            channel.postMessage({ 
-                type: 'join', 
-                senderId: myIdRef.current, 
-                user: { 
-                    id: myIdRef.current, 
-                    name: participantsRef.current.find(p=>p.isLocal)?.name || 'User', 
-                    role: participantsRef.current.find(p=>p.isLocal)?.role || 'User' 
-                } 
-            } as SignalMessage);
-        }, 1000);
-    }
-
     return () => {
         // Only close if we are actually leaving the platform context or meeting code changes
-        // But since we removed 'view' from deps, this cleanup only runs on unmount or code change
         channel.postMessage({ type: 'leave', senderId: myIdRef.current } as SignalMessage);
         channel.close();
     };
   }, [meetingCode]); // Removed 'view' dependency to keep connection alive during transition
+
+  // Helper to announce join
+  const announceJoin = useCallback(() => {
+       if (signalingRef.current && myIdRef.current) {
+           const localUser = participantsRef.current.find(p => p.isLocal);
+           signalingRef.current.postMessage({ 
+                type: 'join', 
+                senderId: myIdRef.current, 
+                user: { 
+                    id: myIdRef.current, 
+                    name: localUser?.name || 'User', 
+                    role: localUser?.role || 'User' 
+                } 
+           } as SignalMessage);
+       }
+  }, []);
+
+  // ANNOUNCE PRESENCE BURST WHEN ENTERING ROOM
+  useEffect(() => {
+    if (view === 'room' && meetingCode && signalingRef.current && myIdRef.current && !myIdRef.current.startsWith('host-')) {
+        // Burst of join messages to ensure Host hears it regardless of race conditions
+        const times = [500, 1500, 3000];
+        const timers = times.map(t => setTimeout(() => {
+             announceJoin();
+             console.log("Sent JOIN burst");
+        }, t));
+        
+        return () => timers.forEach(t => clearTimeout(t));
+    }
+  }, [view, meetingCode, announceJoin]);
+  
+  // HOST HEARTBEAT
+  useEffect(() => {
+      if (view === 'room' && amIHost && signalingRef.current) {
+          const interval = setInterval(() => {
+              signalingRef.current?.postMessage({ type: 'meeting-heartbeat', senderId: myIdRef.current } as SignalMessage);
+          }, 2000);
+          return () => clearInterval(interval);
+      }
+  }, [view, amIHost]);
 
 
   // --- App Flow Handlers ---
@@ -625,14 +682,18 @@ const MeetingPlatform: React.FC<MeetingPlatformProps> = ({ onBack }) => {
     setMeetingStartTime(Date.now());
     addEvent('join', 'Meeting started by Host.', 'Host');
     
-    // Connect to any joiners who are already waiting
-    participantsRef.current.forEach(p => {
-        initiateConnection(p.id, p.name, p.role);
-    });
+    // Connect to any joiners who are already waiting in the list
+    setTimeout(() => {
+        participantsRef.current.forEach(p => {
+            if (!p.isLocal) {
+                 initiateConnection(p.id, p.name, p.role);
+            }
+        });
+    }, 100);
 
     setView('room');
     
-    // Announce to channel that Host is fully in room (triggers offer exchange if needed)
+    // Host also announces self, just in case
     if (signalingRef.current) {
         signalingRef.current.postMessage({ 
             type: 'join', 
@@ -712,7 +773,6 @@ const MeetingPlatform: React.FC<MeetingPlatformProps> = ({ onBack }) => {
     // This fixes issues where browser throttles background tabs or messages drop.
     if (checkResult === 'timeout') {
          console.warn("Validation timed out. Joining anyway (blind trust).");
-         // Optional: Show a toast? For now, we just proceed to prevent blocking the user.
     }
 
     // Code is valid (or trusted), proceed
@@ -1261,6 +1321,11 @@ const MeetingPlatform: React.FC<MeetingPlatformProps> = ({ onBack }) => {
                     <span className="bg-red-500/20 text-red-400 text-xs px-2 py-1 rounded animate-pulse">● REC & Analyzing</span>
                 </div>
                 <div className="flex gap-2">
+                    {/* Sync Button */}
+                     <button onClick={announceJoin} className="px-3 py-1 bg-gray-800 hover:bg-gray-700 text-gray-400 text-xs rounded border border-gray-600 flex items-center gap-1" title="Manually Sync/Reconnect">
+                        <RefreshIcon />
+                    </button>
+                    
                     {/* Dev Tool: Add simulated bot */}
                     <button onClick={addSimulatedBot} className="px-3 py-1 bg-gray-800 hover:bg-gray-700 text-gray-400 text-xs rounded border border-gray-600">
                         + Sim Bot
