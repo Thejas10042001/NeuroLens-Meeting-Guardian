@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Meeting Room System</title>
+    <script src="/socket.io/socket.io.js"></script>
+    <style>
+        body { font-family: sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; background: #f4f4f9; }
+        .container { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); margin-bottom: 20px; }
+        h1 { color: #333; }
+        button { background: #007bff; color: white; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer; }
+        button:hover { background: #0056b3; }
+        input { padding: 10px; border: 1px solid #ddd; border-radius: 4px; margin-right: 10px; }
+        .hidden { display: none; }
+        .code-display { font-size: 2em; font-family: monospace; letter-spacing: 5px; color: #333; margin: 20px 0; font-weight: bold; }
+        #log { border-top: 1px solid #eee; padding-top: 20px; }
+        .participant { padding: 5px 10px; background: #eef; margin: 5px 0; border-radius: 4px; }
+    </style>
+</head>
+<body>
+
+    <h1>Meeting Room System</h1>
+
+    <!-- Selection View -->
+    <div id="view-select" class="container">
+        <h2>What would you like to do?</h2>
+        <button onclick="showHost()">Host a Meeting</button>
+        <button onclick="showJoin()">Join a Meeting</button>
+    </div>
+
+    <!-- Host View -->
+    <div id="view-host" class="container hidden">
+        <h2>Host Panel</h2>
+        <button onclick="createRoom()">Generate New Room</button>
+        <div id="host-room-info" class="hidden">
+            <p>Share this code with participants:</p>
+            <div id="room-code-display" class="code-display"></div>
+            <p>Room expires in 1 hour.</p>
+            <h3>Roster:</h3>
+            <div id="host-roster"></div>
+        </div>
+    </div>
+
+    <!-- Join View -->
+    <div id="view-join" class="container hidden">
+        <h2>Join Meeting</h2>
+        <div>
+            <input type="text" id="join-code" placeholder="Enter 5-Char Code" maxlength="5" style="text-transform:uppercase">
+            <input type="text" id="join-name" placeholder="Your Name">
+            <button onclick="joinRoom()">Join</button>
+        </div>
+        <p id="join-error" style="color: red;"></p>
+        <div id="join-status" class="hidden">
+            <h3>Connected to Room!</h3>
+            <p>Waiting for host...</p>
+        </div>
+    </div>
+
+    <div id="log" class="container">
+        <h3>Activity Log</h3>
+        <div id="activity-list"></div>
+    </div>
+
+    <script>
+        const socket = io();
+        let currentRoomCode = null;
+
+        // UI Switching
+        function showHost() {
+            document.getElementById('view-select').classList.add('hidden');
+            document.getElementById('view-host').classList.remove('hidden');
+        }
+
+        function showJoin() {
+            document.getElementById('view-select').classList.add('hidden');
+            document.getElementById('view-join').classList.remove('hidden');
+        }
+
+        function log(msg) {
+            const el = document.createElement('div');
+            el.innerText = `[${new Date().toLocaleTimeString()}] ${msg}`;
+            document.getElementById('activity-list').prepend(el);
+        }
+
+        // HOST LOGIC
+        async function createRoom() {
+            try {
+                const res = await fetch('/api/create-room', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ hostId: 'host-' + Date.now(), meta: { type: 'demo' } })
+                });
+                
+                const data = await res.json();
+                if (data.error) return alert(data.error);
+
+                currentRoomCode = data.code;
+                document.getElementById('room-code-display').innerText = data.code;
+                document.getElementById('host-room-info').classList.remove('hidden');
+                
+                // Host joins socket room
+                socket.emit('host-create', data.code);
+                log(`Room created: ${data.code}`);
+            } catch (e) {
+                console.error(e);
+                alert('Failed to create room');
+            }
+        }
+
+        // JOINER LOGIC
+        async function joinRoom() {
+            const code = document.getElementById('join-code').value.toUpperCase();
+            const name = document.getElementById('join-name').value;
+            const errorEl = document.getElementById('join-error');
+
+            if (code.length !== 5 || !name) {
+                errorEl.innerText = "Please enter a valid code and name.";
+                return;
+            }
+
+            try {
+                // 1. Validate via API
+                const res = await fetch('/api/join-room', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ code, userId: 'user-' + Date.now() })
+                });
+
+                const data = await res.json();
+                
+                if (res.status === 429) {
+                    errorEl.innerText = "Too many attempts. Slow down.";
+                    return;
+                }
+                
+                if (data.error) {
+                    errorEl.innerText = data.error;
+                    return;
+                }
+
+                // 2. Connect via Socket
+                errorEl.innerText = "";
+                socket.emit('join-with-code', { code, user: { name } });
+                
+                document.getElementById('join-status').classList.remove('hidden');
+                currentRoomCode = code;
+                log(`Joined room ${code} successfully.`);
+
+            } catch (e) {
+                console.error(e);
+                errorEl.innerText = "Network error.";
+            }
+        }
+
+        // SOCKET EVENTS
+        socket.on('participant-joined', (data) => {
+            log(`Participant joined: ${data.user.name}`);
+            
+            // If I am the host, update roster
+            const roster = document.getElementById('host-roster');
+            if (roster) {
+                const p = document.createElement('div');
+                p.className = 'participant';
+                p.innerText = data.user.name;
+                roster.appendChild(p);
+            }
+        });
+
+        socket.on('error', (msg) => {
+            alert("Socket Error: " + msg);
+        });
+
+    </script>
+</body>
+</html>
