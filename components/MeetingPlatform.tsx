@@ -1,5 +1,6 @@
 
 import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { io, Socket } from 'socket.io-client';
 import { CameraIcon } from './icons/CameraIcon';
 import { BrainIcon } from './icons/BrainIcon';
 import { ExclamationIcon } from './icons/ExclamationIcon';
@@ -71,15 +72,6 @@ type SignalMessage =
   | { type: 'meeting-full'; senderId: string }
   | { type: 'admin-action'; senderId: string; targetId: string; action: 'toggle-audio' | 'toggle-video' }
   | { type: 'participant-update'; senderId: string; updates: Partial<Participant> };
-
-const generateMeetingCode = () => {
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-  let result = '';
-  for (let i = 0; i < 5; i++) {
-    result += chars.charAt(Math.floor(Math.random() * chars.length));
-  }
-  return result;
-};
 
 interface VideoTileProps {
     participant: Participant;
@@ -214,7 +206,7 @@ const MeetingPlatform: React.FC<MeetingPlatformProps> = ({ onBack }) => {
   const [hasConsented, setHasConsented] = useState(false);
   
   // WebRTC Refs
-  const signalingRef = useRef<BroadcastChannel | null>(null);
+  const socketRef = useRef<Socket | null>(null); // SOCKET REF
   const peersRef = useRef<{ [key: string]: RTCPeerConnection }>({});
   const iceCandidatesQueue = useRef<{ [key: string]: RTCIceCandidateInit[] }>({});
   const myIdRef = useRef<string>('');
@@ -224,6 +216,7 @@ const MeetingPlatform: React.FC<MeetingPlatformProps> = ({ onBack }) => {
   // Use Refs for state accessible in useEffect to avoid stale closures and re-runs
   const viewRef = useRef<PlatformView>('landing');
   const maxParticipantsRef = useRef(4);
+  const meetingCodeRef = useRef('');
   
   // Remote AI Simulation Refs
   const remoteModelsRef = useRef<{ [id: string]: CognitiveModel }>({});
@@ -268,6 +261,140 @@ const MeetingPlatform: React.FC<MeetingPlatformProps> = ({ onBack }) => {
   useEffect(() => {
       maxParticipantsRef.current = maxParticipants;
   }, [maxParticipants]);
+  
+  // Sync meeting code ref
+  useEffect(() => {
+      meetingCodeRef.current = meetingCode;
+  }, [meetingCode]);
+
+  // Initialize Socket on Mount
+  useEffect(() => {
+      // Connect directly to the backend URL to avoid proxy issues with polling
+      const newSocket = io('http://localhost:3000', {
+          transports: ['websocket', 'polling'], // Allow negotiation
+          withCredentials: true,
+          reconnection: true,
+          reconnectionAttempts: 10,
+          timeout: 20000,
+      }); 
+      socketRef.current = newSocket;
+
+      newSocket.on('connect', () => {
+          console.log("Socket connected:", newSocket.id);
+          // Only set myIdRef if we don't have a specific role/id yet
+          if (!myIdRef.current) {
+              myIdRef.current = newSocket.id || '';
+          }
+      });
+      
+      newSocket.on('connect_error', (err) => {
+          console.error("Socket connection error:", err);
+      });
+
+      newSocket.on('signal', (data: SignalMessage) => {
+           handleSignalMessage(data);
+      });
+
+      return () => {
+          newSocket.disconnect();
+      };
+  }, []);
+
+  const handleSignalMessage = async (msg: SignalMessage) => {
+        // Ignore messages if we are not in a room (except check-meeting might happen early)
+        if (viewRef.current === 'landing') return;
+
+        // Message Handling
+        switch (msg.type) {
+            case 'join':
+                addEvent('join', `${msg.user.name} joined the room.`, msg.user.name);
+                
+                // Add to participants immediately
+                setParticipants(prev => {
+                     if (prev.some(p => p.id === msg.user.id)) return prev;
+                     return [...prev, {
+                         id: msg.user.id,
+                         name: msg.user.name,
+                         role: msg.user.role,
+                         isHost: false,
+                         isLocal: false,
+                         hasVideo: true,
+                         hasAudio: true,
+                         status: 'active',
+                         metrics: { attention: 50, stress: 30, curiosity: 50, postureScore: 0 }
+                     }];
+                });
+                
+                // If we are in room view, initiate connection
+                if (viewRef.current === 'room') {
+                     initiateConnection(msg.user.id, msg.user.name, msg.user.role);
+                }
+                break;
+            case 'offer':
+                // Check if msg has user info to add participant if missing
+                if ('user' in msg) {
+                    handleOffer(msg.senderId, msg.sdp, msg.user);
+                }
+                break;
+            case 'answer':
+                handleAnswer(msg.senderId, msg.sdp);
+                break;
+            case 'ice-candidate':
+                handleCandidate(msg.senderId, msg.candidate);
+                break;
+            case 'leave':
+                handleLeave(msg.senderId);
+                break;
+            case 'check-meeting':
+                // Only Host replies
+                const currentCount = participantsRef.current.length;
+                const isFull = currentCount >= maxParticipantsRef.current;
+                
+                if (socketRef.current && meetingCodeRef.current) {
+                     sendSignal({ 
+                         type: isFull ? 'meeting-full' : 'meeting-alive', 
+                         senderId: myIdRef.current 
+                     });
+                }
+                break;
+            case 'meeting-heartbeat':
+                // Auto-join if logic missed
+                if (!participantsRef.current.find(p => p.id === msg.senderId) && viewRef.current === 'room') {
+                     announceJoin();
+                }
+                break;
+            case 'admin-action':
+                if (msg.targetId === myIdRef.current && localStreamRef.current) {
+                    if (msg.action === 'toggle-audio') {
+                        localStreamRef.current.getAudioTracks().forEach(t => t.enabled = !t.enabled);
+                        const hasAudio = localStreamRef.current.getAudioTracks().some(t => t.enabled);
+                        setParticipants(prev => prev.map(p => p.isLocal ? { ...p, hasAudio } : p));
+                        sendSignal({ type: 'participant-update', senderId: myIdRef.current, updates: { hasAudio } });
+                        addEvent('warning', hasAudio ? 'Host enabled your microphone.' : 'Host disabled your microphone.', 'You');
+                    } else if (msg.action === 'toggle-video') {
+                        localStreamRef.current.getVideoTracks().forEach(t => t.enabled = !t.enabled);
+                        const hasVideo = localStreamRef.current.getVideoTracks().some(t => t.enabled);
+                        setParticipants(prev => prev.map(p => p.isLocal ? { ...p, hasVideo } : p));
+                        sendSignal({ type: 'participant-update', senderId: myIdRef.current, updates: { hasVideo } });
+                        addEvent('warning', hasVideo ? 'Host enabled your camera.' : 'Host disabled your camera.', 'You');
+                    }
+                }
+                break;
+            case 'participant-update':
+                setParticipants(prev => prev.map(p => p.id === msg.senderId ? { ...p, ...msg.updates } : p));
+                break;
+        }
+  };
+
+  const sendSignal = (msg: SignalMessage) => {
+      // Use ref to ensure we have the code even if state is pending
+      const code = meetingCodeRef.current;
+      if (socketRef.current && code) {
+          // Wrap in object with room for server to relay
+          socketRef.current.emit('signal', { room: code, ...msg });
+      }
+  };
+
 
   // Initialize Local Camera
   const startCamera = async () => {
@@ -298,9 +425,6 @@ const MeetingPlatform: React.FC<MeetingPlatformProps> = ({ onBack }) => {
     return () => {
       if (localStreamRef.current) {
         localStreamRef.current.getTracks().forEach(track => track.stop());
-      }
-      if (signalingRef.current) {
-          signalingRef.current.close();
       }
       Object.values(peersRef.current).forEach((pc) => (pc as RTCPeerConnection).close());
     };
@@ -363,13 +487,13 @@ const MeetingPlatform: React.FC<MeetingPlatformProps> = ({ onBack }) => {
 
       // Handle ICE candidates
       pc.onicecandidate = (event) => {
-          if (event.candidate && signalingRef.current) {
-              signalingRef.current.postMessage({
+          if (event.candidate) {
+              sendSignal({
                   type: 'ice-candidate',
                   targetId,
                   senderId: myIdRef.current,
                   candidate: event.candidate
-              } as SignalMessage);
+              });
           }
       };
 
@@ -413,15 +537,13 @@ const MeetingPlatform: React.FC<MeetingPlatformProps> = ({ onBack }) => {
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
 
-      if (signalingRef.current) {
-          signalingRef.current.postMessage({
-              type: 'offer',
-              targetId,
-              senderId: myIdRef.current,
-              sdp: offer,
-              user: { id: myIdRef.current, name: userName || 'Host', role: userRole || 'Host' }
-          } as SignalMessage);
-      }
+      sendSignal({
+          type: 'offer',
+          targetId,
+          senderId: myIdRef.current,
+          sdp: offer,
+          user: { id: myIdRef.current, name: userName || 'Host', role: userRole || 'Host' }
+      });
   };
 
   const handleOffer = async (senderId: string, sdp: RTCSessionDescriptionInit, senderUser: {name: string, role: string}) => {
@@ -439,14 +561,12 @@ const MeetingPlatform: React.FC<MeetingPlatformProps> = ({ onBack }) => {
           iceCandidatesQueue.current[senderId] = [];
       }
 
-      if (signalingRef.current) {
-          signalingRef.current.postMessage({
-              type: 'answer',
-              targetId: senderId,
-              senderId: myIdRef.current,
-              sdp: answer
-          } as SignalMessage);
-      }
+      sendSignal({
+          type: 'answer',
+          targetId: senderId,
+          senderId: myIdRef.current,
+          sdp: answer
+      });
   };
 
   const handleAnswer = async (senderId: string, sdp: RTCSessionDescriptionInit) => {
@@ -490,136 +610,33 @@ const MeetingPlatform: React.FC<MeetingPlatformProps> = ({ onBack }) => {
       });
   };
 
-  // Initialize Room & Signaling
-  useEffect(() => {
-    // We want signaling active in both 'room' AND 'host-setup' to allow joiners to connect immediately
-    if (!meetingCode) return;
-    
-    // Use BroadcastChannel for tab-to-tab communication (simulates signaling server)
-    const channelName = `neuro-meet-${meetingCode.trim()}`;
-    const channel = new BroadcastChannel(channelName);
-    signalingRef.current = channel;
-
-    console.log(`Connected to signaling channel: ${channelName} with ID: ${myIdRef.current}`);
-
-    channel.onmessage = async (event) => {
-        const msg = event.data as SignalMessage;
-        
-        // Ignore own messages
-        if (msg.senderId === myIdRef.current) return;
-        
-        // Use 'in' check to narrow type and safely access targetId
-        if ('targetId' in msg && msg.targetId && msg.targetId !== myIdRef.current) return;
-
-        switch (msg.type) {
-            case 'join':
-                addEvent('join', `${msg.user.name} joined the room.`, msg.user.name);
-                // If we are in setup, just add them to the list, don't initiate connection yet
-                // If we are in room, initiate connection
-                if (viewRef.current === 'room') {
-                     initiateConnection(msg.user.id, msg.user.name, msg.user.role);
-                } else {
-                     // Add to participants list so they are there when we start
-                     setParticipants(prev => {
-                         if (prev.some(p => p.id === msg.user.id)) return prev;
-                         return [...prev, {
-                             id: msg.user.id,
-                             name: msg.user.name,
-                             role: msg.user.role,
-                             isHost: false,
-                             isLocal: false,
-                             hasVideo: true, // Assume true, will update when track arrives
-                             hasAudio: true,
-                             status: 'active',
-                             metrics: { attention: 50, stress: 30, curiosity: 50, postureScore: 0 }
-                         }];
-                     });
-                }
-                break;
-            case 'offer':
-                handleOffer(msg.senderId, msg.sdp, msg.user);
-                break;
-            case 'answer':
-                handleAnswer(msg.senderId, msg.sdp);
-                break;
-            case 'ice-candidate':
-                handleCandidate(msg.senderId, msg.candidate);
-                break;
-            case 'leave':
-                handleLeave(msg.senderId);
-                break;
-            case 'check-meeting':
-                // Check if room is full
-                let currentCount = participantsRef.current.length;
-                if (viewRef.current === 'host-setup') currentCount += 1; // Count self as host
-                
-                if (currentCount >= maxParticipantsRef.current) {
-                    channel.postMessage({ type: 'meeting-full', senderId: myIdRef.current });
-                } else {
-                    channel.postMessage({ type: 'meeting-alive', senderId: myIdRef.current || 'host-init' });
-                }
-                break;
-            case 'meeting-heartbeat':
-                // If I am a joiner and I am not connected to this host, trigger join
-                if (!participantsRef.current.find(p => p.id === msg.senderId) && viewRef.current === 'room') {
-                     announceJoin();
-                }
-                break;
-            case 'admin-action':
-                // Handle host controls
-                if (msg.targetId === myIdRef.current && localStreamRef.current) {
-                    if (msg.action === 'toggle-audio') {
-                        localStreamRef.current.getAudioTracks().forEach(t => t.enabled = !t.enabled);
-                        const hasAudio = localStreamRef.current.getAudioTracks().some(t => t.enabled);
-                        setParticipants(prev => prev.map(p => p.isLocal ? { ...p, hasAudio } : p));
-                        channel.postMessage({ type: 'participant-update', senderId: myIdRef.current, updates: { hasAudio } } as SignalMessage);
-                        addEvent('warning', hasAudio ? 'Host enabled your microphone.' : 'Host disabled your microphone.', 'You');
-                    } else if (msg.action === 'toggle-video') {
-                        localStreamRef.current.getVideoTracks().forEach(t => t.enabled = !t.enabled);
-                        const hasVideo = localStreamRef.current.getVideoTracks().some(t => t.enabled);
-                        setParticipants(prev => prev.map(p => p.isLocal ? { ...p, hasVideo } : p));
-                        channel.postMessage({ type: 'participant-update', senderId: myIdRef.current, updates: { hasVideo } } as SignalMessage);
-                        addEvent('warning', hasVideo ? 'Host enabled your camera.' : 'Host disabled your camera.', 'You');
-                    }
-                }
-                break;
-            case 'participant-update':
-                setParticipants(prev => prev.map(p => p.id === msg.senderId ? { ...p, ...msg.updates } : p));
-                break;
-        }
-    };
-
-    return () => {
-        // Only close if we are actually leaving the platform context or meeting code changes
-        channel.postMessage({ type: 'leave', senderId: myIdRef.current } as SignalMessage);
-        channel.close();
-    };
-  }, [meetingCode]); // Removed 'view' dependency to keep connection alive during transition
 
   // Helper to announce join
-  const announceJoin = useCallback(() => {
-       if (signalingRef.current && myIdRef.current) {
+  const announceJoin = useCallback((userOverride?: {name: string, role: string}) => {
+       const code = meetingCodeRef.current;
+       const myId = myIdRef.current;
+       
+       if (myId && code) {
            const localUser = participantsRef.current.find(p => p.isLocal);
-           signalingRef.current.postMessage({ 
+           sendSignal({ 
                 type: 'join', 
-                senderId: myIdRef.current, 
+                senderId: myId, 
                 user: { 
-                    id: myIdRef.current, 
-                    name: localUser?.name || 'User', 
-                    role: localUser?.role || 'User' 
+                    id: myId, 
+                    name: userOverride?.name || localUser?.name || 'User', 
+                    role: userOverride?.role || localUser?.role || 'User' 
                 } 
-           } as SignalMessage);
+           });
        }
   }, []);
 
   // ANNOUNCE PRESENCE BURST WHEN ENTERING ROOM
   useEffect(() => {
-    if (view === 'room' && meetingCode && signalingRef.current && myIdRef.current && !myIdRef.current.startsWith('host-')) {
+    if (view === 'room' && meetingCode) {
         // Burst of join messages to ensure Host hears it regardless of race conditions
         const times = [500, 1500, 3000];
         const timers = times.map(t => setTimeout(() => {
              announceJoin();
-             console.log("Sent JOIN burst");
         }, t));
         
         return () => timers.forEach(t => clearTimeout(t));
@@ -628,10 +645,10 @@ const MeetingPlatform: React.FC<MeetingPlatformProps> = ({ onBack }) => {
   
   // HOST HEARTBEAT
   useEffect(() => {
-      if (view === 'room' && amIHost && signalingRef.current) {
+      if (view === 'room' && amIHost) {
           const interval = setInterval(() => {
-              signalingRef.current?.postMessage({ type: 'meeting-heartbeat', senderId: myIdRef.current } as SignalMessage);
-          }, 2000);
+              sendSignal({ type: 'meeting-heartbeat', senderId: myIdRef.current });
+          }, 3000);
           return () => clearInterval(interval);
       }
   }, [view, amIHost]);
@@ -640,20 +657,37 @@ const MeetingPlatform: React.FC<MeetingPlatformProps> = ({ onBack }) => {
   // --- App Flow Handlers ---
 
   const handleHostStart = async () => {
-    const code = generateMeetingCode();
-    
-    // IMPORTANT: Set ID FIRST so it is available when the channel hook runs
-    const hostId = `host-${Date.now()}`;
-    myIdRef.current = hostId;
-    
-    // Trigger state update which triggers useEffect
-    setMeetingCode(code);
-    setHasConsented(false);
-    
-    // Clear any previous state
-    setParticipants([]); 
-    
-    setView('host-setup');
+    try {
+        const res = await fetch('/api/create-room', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ hostId: 'host-' + Date.now(), meta: { type: 'demo' } })
+        });
+        const data = await res.json();
+        
+        if (data.error) {
+            alert(data.error);
+            return;
+        }
+
+        const code = data.code;
+        setMeetingCode(code);
+        meetingCodeRef.current = code; // FORCE UPDATE REF
+        
+        // Join Socket Room
+        if (socketRef.current) {
+            socketRef.current.emit('join-room', code);
+            myIdRef.current = socketRef.current.id || '';
+        }
+        
+        setHasConsented(false);
+        setParticipants([]); 
+        setView('host-setup');
+
+    } catch (e) {
+        console.error(e);
+        alert("Failed to start meeting session.");
+    }
   };
 
   const confirmHostMeeting = async () => {
@@ -662,7 +696,7 @@ const MeetingPlatform: React.FC<MeetingPlatformProps> = ({ onBack }) => {
     
     // Add Host to participants (use existing ID)
     const hostUser: Participant = {
-      id: myIdRef.current, // Use the ID generated in handleHostStart
+      id: myIdRef.current,
       name: 'You (Host)',
       role: 'Host',
       isHost: true,
@@ -674,15 +708,11 @@ const MeetingPlatform: React.FC<MeetingPlatformProps> = ({ onBack }) => {
       metrics: { attention: 85, stress: 20, curiosity: 75, postureScore: 0 }
     };
     
-    setParticipants(prev => {
-        // Merge host into existing list (which might contain early joiners)
-        return [...prev, hostUser];
-    });
-    
+    setParticipants(prev => [...prev, hostUser]);
     setMeetingStartTime(Date.now());
     addEvent('join', 'Meeting started by Host.', 'Host');
     
-    // Connect to any joiners who are already waiting in the list
+    // Trigger connections for anyone already waiting
     setTimeout(() => {
         participantsRef.current.forEach(p => {
             if (!p.isLocal) {
@@ -692,15 +722,9 @@ const MeetingPlatform: React.FC<MeetingPlatformProps> = ({ onBack }) => {
     }, 100);
 
     setView('room');
-    
-    // Host also announces self, just in case
-    if (signalingRef.current) {
-        signalingRef.current.postMessage({ 
-            type: 'join', 
-            senderId: myIdRef.current, 
-            user: { id: hostUser.id, name: hostUser.name, role: hostUser.role } 
-        } as SignalMessage);
-    }
+    // Ensure code ref is set (redundant but safe)
+    meetingCodeRef.current = meetingCode;
+    announceJoin({name: 'You (Host)', role: 'Host'});
   };
 
   const handleJoinStart = () => {
@@ -724,80 +748,56 @@ const MeetingPlatform: React.FC<MeetingPlatformProps> = ({ onBack }) => {
     setIsValidating(true);
     setJoinError(null);
 
-    // Validate Code by pinging the room channel
-    const checkResult = await new Promise<'alive' | 'full' | 'timeout'>((resolve) => {
-        const tempChannel = new BroadcastChannel(`neuro-meet-${codeToJoin}`);
-        let resolved = false;
+    // 1. API Join Check
+    try {
+        const res = await fetch('/api/join-room', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ code: codeToJoin, userId: 'user-' + Date.now() })
+        });
+        
+        if (!res.ok) {
+            const data = await res.json();
+            throw new Error(data.error || 'Failed to join');
+        }
 
-        const cleanup = () => {
-            resolved = true;
-            clearInterval(pingInterval);
-            clearTimeout(timeout);
-            tempChannel.close();
+        // 2. Proceed
+        setIsValidating(false);
+        setMeetingCode(codeToJoin);
+        meetingCodeRef.current = codeToJoin; // FORCE UPDATE REF
+        
+        // Join Socket Room
+        if (socketRef.current) {
+            socketRef.current.emit('join-room', codeToJoin);
+            myIdRef.current = socketRef.current.id || '';
+        }
+
+        const stream = await startCamera();
+        const joinerUser: Participant = {
+          id: myIdRef.current,
+          name: `${userName} (You)`,
+          role: userRole,
+          isHost: false,
+          isLocal: true,
+          hasVideo: !!stream,
+          hasAudio: !!stream,
+          status: 'active',
+          stream: stream || undefined,
+          metrics: { attention: 80, stress: 30, curiosity: 60, postureScore: 0 }
         };
 
-        tempChannel.onmessage = (e) => {
-            const msg = e.data as SignalMessage;
-            if (msg.type === 'meeting-alive') {
-                cleanup();
-                resolve('alive');
-            } else if (msg.type === 'meeting-full') {
-                cleanup();
-                resolve('full');
-            }
-        };
+        setParticipants([joinerUser]);
+        setMeetingStartTime(Date.now());
+        addEvent('join', `You joined the meeting.`, userName);
+        setView('room');
+        
+        // Announce immediately
+        announceJoin({ name: `${userName} (You)`, role: userRole });
 
-        // Send check multiple times to ensure delivery (retry logic)
-        // FASTER PING (250ms)
-        const pingInterval = setInterval(() => {
-             tempChannel.postMessage({ type: 'check-meeting', senderId: 'temp-validator' } as SignalMessage);
-        }, 250);
-
-        // Timeout after 3 seconds - IF TIMEOUT, WE ASSUME ALIVE (Soft Validation)
-        const timeout = setTimeout(() => {
-            if (!resolved) {
-                cleanup();
-                resolve('timeout');
-            }
-        }, 3000); 
-    });
-
-    setIsValidating(false);
-
-    if (checkResult === 'full') {
-        setJoinError("This meeting has reached maximum capacity.");
-        return;
+    } catch (e: any) {
+        setIsValidating(false);
+        setJoinError(e.message || "Could not connect to room.");
     }
-    
-    // If 'alive' OR 'timeout' (Soft Validation), we proceed. 
-    // This fixes issues where browser throttles background tabs or messages drop.
-    if (checkResult === 'timeout') {
-         console.warn("Validation timed out. Joining anyway (blind trust).");
-    }
-
-    // Code is valid (or trusted), proceed
-    setMeetingCode(codeToJoin);
-    const stream = await startCamera();
-
-    const joinerUser: Participant = {
-      id: `joiner-${Date.now()}`,
-      name: `${userName} (You)`,
-      role: userRole,
-      isHost: false,
-      isLocal: true,
-      hasVideo: !!stream,
-      hasAudio: !!stream,
-      status: 'active',
-      stream: stream || undefined,
-      metrics: { attention: 80, stress: 30, curiosity: 60, postureScore: 0 }
-    };
-
-    setParticipants([joinerUser]);
-    // CRITICAL: Set ID immediately
-    myIdRef.current = joinerUser.id;
-    setMeetingStartTime(Date.now());
-    addEvent('join', `You joined the meeting.`, userName);
-    setView('room');
   };
 
   // Admin Control Handler
@@ -824,14 +824,12 @@ const MeetingPlatform: React.FC<MeetingPlatformProps> = ({ onBack }) => {
     }
 
     // Real user - Send Signal
-    if (signalingRef.current) {
-        signalingRef.current.postMessage({
-            type: 'admin-action',
-            senderId: myIdRef.current,
-            targetId: targetId,
-            action: action
-        } as SignalMessage);
-    }
+    sendSignal({
+        type: 'admin-action',
+        senderId: myIdRef.current,
+        targetId: targetId,
+        action: action
+    });
   };
 
   // Local Controls
@@ -846,13 +844,11 @@ const MeetingPlatform: React.FC<MeetingPlatformProps> = ({ onBack }) => {
     setParticipants(prev => prev.map(p => p.isLocal ? { ...p, hasAudio: enabled } : p));
     
     // Notify others
-    if (signalingRef.current) {
-        signalingRef.current.postMessage({
-            type: 'participant-update',
-            senderId: myIdRef.current,
-            updates: { hasAudio: enabled }
-        } as SignalMessage);
-    }
+    sendSignal({
+        type: 'participant-update',
+        senderId: myIdRef.current,
+        updates: { hasAudio: enabled }
+    });
   };
 
   const toggleLocalVideo = () => {
@@ -866,13 +862,11 @@ const MeetingPlatform: React.FC<MeetingPlatformProps> = ({ onBack }) => {
     setParticipants(prev => prev.map(p => p.isLocal ? { ...p, hasVideo: enabled } : p));
     
     // Notify others
-    if (signalingRef.current) {
-        signalingRef.current.postMessage({
-            type: 'participant-update',
-            senderId: myIdRef.current,
-            updates: { hasVideo: enabled }
-        } as SignalMessage);
-    }
+    sendSignal({
+        type: 'participant-update',
+        senderId: myIdRef.current,
+        updates: { hasVideo: enabled }
+    });
   };
 
 
@@ -1322,7 +1316,7 @@ const MeetingPlatform: React.FC<MeetingPlatformProps> = ({ onBack }) => {
                 </div>
                 <div className="flex gap-2">
                     {/* Sync Button */}
-                     <button onClick={announceJoin} className="px-3 py-1 bg-gray-800 hover:bg-gray-700 text-gray-400 text-xs rounded border border-gray-600 flex items-center gap-1" title="Manually Sync/Reconnect">
+                     <button onClick={() => announceJoin()} className="px-3 py-1 bg-gray-800 hover:bg-gray-700 text-gray-400 text-xs rounded border border-gray-600 flex items-center gap-1" title="Manually Sync/Reconnect">
                         <RefreshIcon />
                     </button>
                     

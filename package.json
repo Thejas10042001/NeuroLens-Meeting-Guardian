@@ -12,7 +12,8 @@
     "socket.io": "^4.7.5",
     "redis": "^4.6.13",
     "cors": "^2.8.5",
-    "helmet": "^7.1.0"
+    "helmet": "^7.1.0",
+    "socket.io-client": "^4.7.5"
   },
   "devDependencies": {
     "jest": "^29.7.0",

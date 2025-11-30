@@ -1,3 +1,4 @@
+
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -13,7 +14,14 @@ const REDIS_URL = process.env.REDIS_URL || 'redis://localhost:6379';
 // Setup App
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server);
+const io = new Server(server, {
+    cors: {
+        origin: ["http://localhost:5173", "http://127.0.0.1:5173"], // Explicitly allow frontend origins
+        methods: ["GET", "POST"],
+        credentials: true
+    },
+    transports: ['polling', 'websocket'] // Allow both
+});
 
 // Redis Client
 const redisClient = createClient({ url: REDIS_URL });
@@ -22,7 +30,11 @@ redisClient.on('error', (err) => console.error('Redis Client Error', err));
 (async () => {
     // Connect to Redis before starting server
     if (process.env.NODE_ENV !== 'test') {
-        await redisClient.connect();
+        try {
+            await redisClient.connect();
+        } catch (e) {
+            console.warn("Redis connection failed. Ensure Redis is running.");
+        }
     }
 })();
 
@@ -84,34 +96,21 @@ app.post('/api/join-room', rateLimit.check, async (req, res) => {
 io.on('connection', (socket) => {
     console.log('User connected:', socket.id);
 
-    // Host joins the room they created
-    socket.on('host-create', (code) => {
+    // Generic Room Joiner
+    socket.on('join-room', (code) => {
         socket.join(code);
-        console.log(`Host ${socket.id} joined room ${code}`);
+        console.log(`Socket ${socket.id} joined room ${code}`);
     });
 
-    // Participant joins with a code (after API validation)
-    socket.on('join-with-code', async ({ code, user }) => {
-        const roomData = await roomService.getRoom(redisClient, code);
-        
-        if (roomData) {
-            socket.join(code);
-            
-            // Broadcast to everyone in the room (including host) that someone new joined
-            io.to(code).emit('participant-joined', {
-                socketId: socket.id,
-                user: user
-            });
-            
-            console.log(`User ${user.name} joined room ${code}`);
-        } else {
-            socket.emit('error', 'Room no longer exists');
+    // WebRTC Signaling Relay
+    // Clients send { room: 'ABCDE', type: 'offer', ... }
+    // Server forwards to everyone else in 'ABCDE'
+    socket.on('signal', (data) => {
+        const { room, ...msg } = data;
+        if (room) {
+            // Broadcast to everyone in the room EXCEPT the sender
+            socket.to(room).emit('signal', msg);
         }
-    });
-
-    socket.on('leave-room', (code) => {
-        socket.leave(code);
-        io.to(code).emit('participant-left', { socketId: socket.id });
     });
 
     socket.on('disconnect', () => {
